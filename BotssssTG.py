@@ -492,7 +492,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         await state.set_state(AuthState.waiting_for_action)
         msg = await message.answer(
             "🔐 Добро пожаловать в Blackout Bazaar.\n\n"
-            "Для доступа к функциям бота необходимо авторизоваться.",
+            "Для доступа к функциям бота необходимо авторизоваться. Это сделано для ананимного трафика, ведь мы заботимся о вашей анонимности",
             reply_markup=auth_kb()
         )
         await save_bot_message(user_id, msg.message_id)
@@ -1461,3 +1461,4 @@ async def main():
 
 if __name__ == '__main__':
     asyncio.run(main())
+
