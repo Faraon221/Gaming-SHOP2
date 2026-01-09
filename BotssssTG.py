@@ -39,16 +39,30 @@ def recreate_tables():
         cursor.execute("DROP TABLE IF EXISTS cart")
         cursor.execute("DROP TABLE IF EXISTS users")
         cursor.execute("DROP TABLE IF EXISTS logs")
+        cursor.execute("DROP TABLE IF EXISTS auth_users")
+        cursor.execute("DROP TABLE IF EXISTS bot_messages")
         
         print("🗑️ Старые таблицы удалены")
         
         # Создаем таблицы заново
         cursor.execute('''
+            CREATE TABLE IF NOT EXISTS auth_users (
+                user_id INTEGER PRIMARY KEY,
+                login TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                is_active INTEGER DEFAULT 1,
+                created_at TIMESTAMP,
+                last_login TIMESTAMP
+            )
+        ''')
+        
+        cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
                 first_name TEXT,
-                join_date TIMESTAMP
+                join_date TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES auth_users(user_id)
             )
         ''')
         
@@ -106,6 +120,15 @@ def recreate_tables():
             )
         ''')
         
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bot_messages (
+                user_id INTEGER,
+                message_id INTEGER,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, message_id)
+            )
+        ''')
+        
         # Вставляем зашифрованные товары
         products = [
             ('@мф3т@м1н', '🎯 Стимуляторы', 2500, 'Высокое качество, чистота 90%. Россия.', '1,00г'),
@@ -126,8 +149,14 @@ def recreate_tables():
             products
         )
         
+        # Создаем тестового пользователя (логин: admin, пароль: admin123)
+        cursor.execute(
+            "INSERT OR IGNORE INTO auth_users (user_id, login, password, created_at) VALUES (?,?,?,?)",
+            (ADMIN_ID, 'admin', 'admin123', datetime.now().isoformat())
+        )
+        
         conn.commit()
-        print("✅ Таблицы пересозданы с зашифрованными товарами")
+        print("✅ Таблицы пересозданы с системой аутентификации")
         
     except Exception as e:
         print(f"❌ Ошибка пересоздания таблиц: {e}")
@@ -253,6 +282,13 @@ def log_action(user_id: int, action: str, details: str = ""):
     conn.close()
 
 # ==================== FSM СОСТОЯНИЯ ====================
+class AuthState(StatesGroup):
+    waiting_for_action = State()
+    waiting_for_login = State()
+    waiting_for_password = State()
+    waiting_for_registration_login = State()
+    waiting_for_registration_password = State()
+
 class OrderState(StatesGroup):
     choosing_district = State()
     choosing_city = State()
@@ -324,6 +360,39 @@ async def check_cryptobot_payment(order_id: int):
     conn.close()
     return False
 
+async def delete_all_user_messages(user_id: int, chat_id: int):
+    """Удаление всех сообщений бота для пользователя"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT message_id FROM bot_messages WHERE user_id = ? ORDER BY timestamp DESC",
+        (user_id,)
+    )
+    messages = cursor.fetchall()
+    
+    # Удаляем все сообщения
+    for msg in messages:
+        try:
+            await bot.delete_message(chat_id, msg[0])
+        except:
+            pass
+    
+    # Очищаем таблицу сообщений для пользователя
+    cursor.execute("DELETE FROM bot_messages WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+async def save_bot_message(user_id: int, message_id: int):
+    """Сохранить ID сообщения бота для последующего удаления"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT OR IGNORE INTO bot_messages (user_id, message_id) VALUES (?, ?)",
+        (user_id, message_id)
+    )
+    conn.commit()
+    conn.close()
+
 async def delete_previous_messages(chat_id: int, message_ids: list):
     """Удаление нескольких предыдущих сообщений"""
     for msg_id in message_ids:
@@ -337,12 +406,19 @@ def generate_six_digit_code():
     return str(random.randint(100000, 999999))
 
 # ==================== КЛАВИАТУРЫ ====================
+def auth_kb():
+    kb = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="🔄 Войти")],
+        [KeyboardButton(text="📝 Зарегистрироваться")]
+    ], resize_keyboard=True)
+    return kb
+
 def main_kb():
     kb = ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="🎯 Каталог"), KeyboardButton(text="🛒 Корзина")],
         [KeyboardButton(text="📦 Мои заказы"), KeyboardButton(text="👨‍💼 Поддержка")],
         [KeyboardButton(text="⚠️ Инструкция"), KeyboardButton(text="💎 Купить TON")],
-        [KeyboardButton(text="🤝 Партнёрка")]
+        [KeyboardButton(text="🤝 Партнёрка"), KeyboardButton(text="🚪 Выйти")]
     ], resize_keyboard=True)
     return kb
 
@@ -393,18 +469,241 @@ def crypto_kb():
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    await register_user(user_id, message.from_user.username, message.from_user.first_name)
-    log_action(user_id, "start_command")
     
-    await state.update_data(prev_messages=[])
-    
-    await message.answer(
-        "🛒 Добро пожаловать в Blackout Bazaar. Выберите раздел:",
-        reply_markup=main_kb()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT user_id FROM auth_users WHERE user_id = ? AND is_active = 1",
+        (user_id,)
     )
+    auth_user = cursor.fetchone()
+    conn.close()
+    
+    if auth_user:
+        # Пользователь уже авторизован
+        await state.update_data(authorized=True, prev_messages=[])
+        msg = await message.answer(
+            "✅ Вы уже авторизованы! Добро пожаловать в Blackout Bazaar.",
+            reply_markup=main_kb()
+        )
+        await save_bot_message(user_id, msg.message_id)
+    else:
+        # Пользователь не авторизован
+        await state.set_state(AuthState.waiting_for_action)
+        msg = await message.answer(
+            "🔐 Добро пожаловать в Blackout Bazaar.\n\n"
+            "Для доступа к функциям бота необходимо авторизоваться.",
+            reply_markup=auth_kb()
+        )
+        await save_bot_message(user_id, msg.message_id)
+    
+    log_action(user_id, "start_command")
+
+@dp.message(F.text == "🔄 Войти")
+async def login_start(message: types.Message, state: FSMContext):
+    await state.set_state(AuthState.waiting_for_login)
+    msg = await message.answer("Введите ваш логин:")
+    await save_bot_message(message.from_user.id, msg.message_id)
+    log_action(message.from_user.id, "login_started")
+
+@dp.message(F.text == "📝 Зарегистрироваться")
+async def register_start(message: types.Message, state: FSMContext):
+    await state.set_state(AuthState.waiting_for_registration_login)
+    msg = await message.answer("Придумайте и введите логин для регистрации:")
+    await save_bot_message(message.from_user.id, msg.message_id)
+    log_action(message.from_user.id, "registration_started")
+
+@dp.message(AuthState.waiting_for_login)
+async def process_login(message: types.Message, state: FSMContext):
+    await state.update_data(login=message.text)
+    await state.set_state(AuthState.waiting_for_password)
+    msg = await message.answer("Введите пароль:")
+    await save_bot_message(message.from_user.id, msg.message_id)
+    log_action(message.from_user.id, "login_entered", f"login: {message.text}")
+
+@dp.message(AuthState.waiting_for_password)
+async def process_password(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    login = data.get('login', '')
+    password = message.text
+    user_id = message.from_user.id
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT user_id FROM auth_users WHERE login = ? AND password = ?",
+        (login, password)
+    )
+    user = cursor.fetchone()
+    
+    if user:
+        # Авторизация успешна
+        cursor.execute(
+            "UPDATE auth_users SET is_active = 1, last_login = ? WHERE user_id = ?",
+            (datetime.now().isoformat(), user[0])
+        )
+        conn.commit()
+        
+        await register_user(user_id, message.from_user.username, message.from_user.first_name)
+        await state.clear()
+        await state.update_data(authorized=True, prev_messages=[])
+        
+        msg = await message.answer(
+            "✅ Авторизация успешна! Добро пожаловать в Blackout Bazaar.",
+            reply_markup=main_kb()
+        )
+        await save_bot_message(user_id, msg.message_id)
+        log_action(user_id, "login_successful", f"login: {login}")
+    else:
+        # Авторизация не удалась
+        await state.set_state(AuthState.waiting_for_action)
+        msg = await message.answer(
+            "❌ Неверный логин или пароль. Попробуйте снова.",
+            reply_markup=auth_kb()
+        )
+        await save_bot_message(user_id, msg.message_id)
+        log_action(user_id, "login_failed", f"login: {login}")
+    
+    conn.close()
+
+@dp.message(AuthState.waiting_for_registration_login)
+async def process_registration_login(message: types.Message, state: FSMContext):
+    login = message.text.strip()
+    
+    if len(login) < 3:
+        msg = await message.answer("❌ Логин должен содержать минимум 3 символа. Попробуйте снова:")
+        await save_bot_message(message.from_user.id, msg.message_id)
+        return
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT user_id FROM auth_users WHERE login = ?",
+        (login,)
+    )
+    existing_user = cursor.fetchone()
+    conn.close()
+    
+    if existing_user:
+        msg = await message.answer("❌ Этот логин уже занят. Выберите другой:")
+        await save_bot_message(message.from_user.id, msg.message_id)
+    else:
+        await state.update_data(reg_login=login)
+        await state.set_state(AuthState.waiting_for_registration_password)
+        msg = await message.answer("Отлично! Теперь придумайте пароль (минимум 6 символов):")
+        await save_bot_message(message.from_user.id, msg.message_id)
+        log_action(message.from_user.id, "registration_login_entered", f"login: {login}")
+
+@dp.message(AuthState.waiting_for_registration_password)
+async def process_registration_password(message: types.Message, state: FSMContext):
+    password = message.text.strip()
+    user_id = message.from_user.id
+    data = await state.get_data()
+    login = data.get('reg_login', '')
+    
+    if len(password) < 6:
+        msg = await message.answer("❌ Пароль должен содержать минимум 6 символов. Попробуйте снова:")
+        await save_bot_message(user_id, msg.message_id)
+        return
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute(
+            "INSERT INTO auth_users (user_id, login, password, created_at, is_active) VALUES (?,?,?,?,?)",
+            (user_id, login, password, datetime.now().isoformat(), 1)
+        )
+        conn.commit()
+        
+        await register_user(user_id, message.from_user.username, message.from_user.first_name)
+        await state.clear()
+        await state.update_data(authorized=True, prev_messages=[])
+        
+        msg = await message.answer(
+            "✅ Регистрация успешна! Добро пожаловать в Blackout Bazaar.",
+            reply_markup=main_kb()
+        )
+        await save_bot_message(user_id, msg.message_id)
+        log_action(user_id, "registration_successful", f"login: {login}")
+        
+    except Exception as e:
+        msg = await message.answer(f"❌ Ошибка регистрации: {str(e)}. Попробуйте снова.", reply_markup=auth_kb())
+        await save_bot_message(user_id, msg.message_id)
+        await state.set_state(AuthState.waiting_for_action)
+        log_action(user_id, "registration_failed", f"error: {str(e)}")
+    
+    conn.close()
+
+# ==================== ПРОВЕРКА АВТОРИЗАЦИИ ====================
+async def check_auth(message: types.Message, state: FSMContext) -> bool:
+    data = await state.get_data()
+    if not data.get('authorized'):
+        msg = await message.answer("❌ Доступ запрещен. Пожалуйста, авторизуйтесь через /start")
+        await save_bot_message(message.from_user.id, msg.message_id)
+        return False
+    return True
+
+@dp.message(F.text == "🚪 Выйти")
+async def logout(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    
+    # Сообщения для выхода
+    exit_messages = [
+        "✅ Безопасный выход выполнен. Сеанс закрыт.",
+        "Следы уничтожены. До новых встреч.",
+        "Сеанс завершён. Бот обезличен."
+    ]
+    
+    # Отправляем первое сообщение
+    msg1 = await message.answer("🔄 Зачищаю переписку...")
+    
+    # Удаляем все сообщения
+    await delete_all_user_messages(user_id, chat_id)
+    
+    # Ждем немного для реалистичности
+    await asyncio.sleep(1)
+    
+    # Отправляем второе сообщение
+    msg2 = await message.answer(random.choice(exit_messages))
+    
+    # Ждем и удаляем первое сообщение
+    await asyncio.sleep(1)
+    try:
+        await bot.delete_message(chat_id, msg1.message_id)
+    except:
+        pass
+    
+    # Обновляем статус пользователя
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE auth_users SET is_active = 0 WHERE user_id = ?",
+        (user_id,)
+    )
+    conn.commit()
+    conn.close()
+    
+    # Очищаем состояние
+    await state.clear()
+    
+    # Возвращаем к аутентификации
+    await asyncio.sleep(2)
+    await state.set_state(AuthState.waiting_for_action)
+    msg3 = await message.answer(
+        "🔐 Для доступа к функциям бота необходимо авторизоваться.",
+        reply_markup=auth_kb()
+    )
+    await save_bot_message(user_id, msg3.message_id)
+    
+    log_action(user_id, "logout_successful")
 
 @dp.message(Command("check_payment"))
 async def cmd_check_payment(message: types.Message, state: FSMContext):
+    if not await check_auth(message, state):
+        return
+    
     user_id = message.from_user.id
     data = await state.get_data()
     prev_messages = data.get('prev_messages', [])
@@ -427,6 +726,7 @@ async def cmd_check_payment(message: types.Message, state: FSMContext):
     if not order:
         msg = await message.answer("У вас нет активных заказов")
         await state.update_data(prev_messages=[msg.message_id])
+        await save_bot_message(user_id, msg.message_id)
         return
     
     order_id, product_id, quantity, total_price, status, invoice_id = order
@@ -441,6 +741,7 @@ async def cmd_check_payment(message: types.Message, state: FSMContext):
         if result and result[0]:
             msg = await message.answer("✅ Ваш заказ уже оплачен. Координаты уже отправлены.")
             await state.update_data(prev_messages=[msg.message_id])
+            await save_bot_message(user_id, msg.message_id)
         else:
             msg = await message.answer(
                 "✅ Оплата подтверждена!\n\n"
@@ -450,6 +751,7 @@ async def cmd_check_payment(message: types.Message, state: FSMContext):
                 "Сообщите номер заказа для получения координат."
             )
             await state.update_data(prev_messages=[msg.message_id])
+            await save_bot_message(user_id, msg.message_id)
         return
     
     is_paid = await check_cryptobot_payment(order_id)
@@ -470,6 +772,7 @@ async def cmd_check_payment(message: types.Message, state: FSMContext):
             "Сообщите номер заказа для получения координат."
         )
         await state.update_data(prev_messages=[msg.message_id])
+        await save_bot_message(user_id, msg.message_id)
         log_action(user_id, "payment_confirmed", f"order: {order_id}")
     else:
         msg = await message.answer(
@@ -477,10 +780,14 @@ async def cmd_check_payment(message: types.Message, state: FSMContext):
             "Пожалуйста, подождите 2-10 минут и проверьте снова командой /check_payment"
         )
         await state.update_data(prev_messages=[msg.message_id])
+        await save_bot_message(user_id, msg.message_id)
 
 # ==================== ОБРАБОТЧИКИ КНОПОК ГЛАВНОГО МЕНЮ ====================
 @dp.message(F.text == "🎯 Каталог")
 async def catalog_start(message: types.Message, state: FSMContext):
+    if not await check_auth(message, state):
+        return
+    
     data = await state.get_data()
     prev_messages = data.get('prev_messages', [])
     
@@ -490,10 +797,14 @@ async def catalog_start(message: types.Message, state: FSMContext):
     await state.set_state(OrderState.choosing_district)
     msg = await message.answer("Сначала выберите федеральный округ:", reply_markup=districts_kb())
     await state.update_data(prev_messages=[msg.message_id])
+    await save_bot_message(message.from_user.id, msg.message_id)
     log_action(message.from_user.id, "start_catalog")
 
 @dp.message(F.text == "🛒 Корзина")
 async def show_cart(message: types.Message, state: FSMContext):
+    if not await check_auth(message, state):
+        return
+    
     data = await state.get_data()
     prev_messages = data.get('prev_messages', [])
     
@@ -506,6 +817,7 @@ async def show_cart(message: types.Message, state: FSMContext):
     if not items:
         msg = await message.answer("🛒 Корзина пуста")
         await state.update_data(prev_messages=[msg.message_id])
+        await save_bot_message(user_id, msg.message_id)
         return
     
     text = "🛒 Ваша корзина:\n\n"
@@ -525,10 +837,14 @@ async def show_cart(message: types.Message, state: FSMContext):
     
     msg = await message.answer(text, reply_markup=kb)
     await state.update_data(prev_messages=[msg.message_id])
+    await save_bot_message(user_id, msg.message_id)
     log_action(user_id, "view_cart", f"items: {len(items)}")
 
 @dp.message(F.text == "📦 Мои заказы")
 async def show_orders(message: types.Message, state: FSMContext):
+    if not await check_auth(message, state):
+        return
+    
     data = await state.get_data()
     prev_messages = data.get('prev_messages', [])
     
@@ -554,6 +870,7 @@ async def show_orders(message: types.Message, state: FSMContext):
     if not orders:
         msg = await message.answer("📦 У вас нет заказов")
         await state.update_data(prev_messages=[msg.message_id])
+        await save_bot_message(user_id, msg.message_id)
         return
     
     text = "📦 Ваши последние заказы:\n\n"
@@ -567,10 +884,14 @@ async def show_orders(message: types.Message, state: FSMContext):
     
     msg = await message.answer(text)
     await state.update_data(prev_messages=[msg.message_id])
+    await save_bot_message(user_id, msg.message_id)
     log_action(user_id, "view_orders")
 
 @dp.message(F.text == "👨‍💼 Поддержка")
 async def support(message: types.Message, state: FSMContext):
+    if not await check_auth(message, state):
+        return
+    
     data = await state.get_data()
     prev_messages = data.get('prev_messages', [])
     
@@ -588,10 +909,14 @@ async def support(message: types.Message, state: FSMContext):
         reply_markup=kb
     )
     await state.update_data(prev_messages=[msg.message_id])
+    await save_bot_message(message.from_user.id, msg.message_id)
     log_action(message.from_user.id, "support_requested")
 
 @dp.message(F.text == "⚠️ Инструкция")
 async def instructions(message: types.Message, state: FSMContext):
+    if not await check_auth(message, state):
+        return
+    
     data = await state.get_data()
     prev_messages = data.get('prev_messages', [])
     
@@ -607,10 +932,14 @@ async def instructions(message: types.Message, state: FSMContext):
         reply_markup=kb
     )
     await state.update_data(prev_messages=[msg.message_id])
+    await save_bot_message(message.from_user.id, msg.message_id)
     log_action(message.from_user.id, "instructions_viewed")
 
 @dp.message(F.text == "💎 Купить TON")
 async def buy_ton(message: types.Message, state: FSMContext):
+    if not await check_auth(message, state):
+        return
+    
     data = await state.get_data()
     prev_messages = data.get('prev_messages', [])
     
@@ -626,10 +955,14 @@ async def buy_ton(message: types.Message, state: FSMContext):
         "5. Оплати"
     )
     await state.update_data(prev_messages=[msg.message_id])
+    await save_bot_message(message.from_user.id, msg.message_id)
     log_action(message.from_user.id, "buy_ton_requested")
 
 @dp.message(F.text == "🤝 Партнёрка")
 async def partner(message: types.Message, state: FSMContext):
+    if not await check_auth(message, state):
+        return
+    
     data = await state.get_data()
     prev_messages = data.get('prev_messages', [])
     
@@ -644,6 +977,7 @@ async def partner(message: types.Message, state: FSMContext):
         "Статистика: /stats"
     )
     await state.update_data(prev_messages=[msg.message_id])
+    await save_bot_message(message.from_user.id, msg.message_id)
     log_action(message.from_user.id, "partner_viewed")
 
 # ==================== ОБРАБОТЧИКИ ДЛЯ КОЛБЭКОВ ====================
@@ -661,11 +995,13 @@ async def checkout_cart(callback: types.CallbackQuery, state: FSMContext):
     if not items:
         msg = await callback.message.answer("Корзина пуста. Добавьте товары из каталога.")
         await state.update_data(prev_messages=[msg.message_id])
+        await save_bot_message(user_id, msg.message_id)
         return
     
     await state.set_state(OrderState.choosing_district)
     msg = await callback.message.answer("Для оформления заказа сначала выберите федеральный округ:", reply_markup=districts_kb())
     await state.update_data(prev_messages=[msg.message_id])
+    await save_bot_message(user_id, msg.message_id)
     log_action(user_id, "cart_checkout_started")
 
 @dp.callback_query(F.data == "clear_cart")
@@ -689,6 +1025,7 @@ async def clear_cart(callback: types.CallbackQuery, state: FSMContext):
     
     msg = await callback.message.answer(f"✅ Корзина очищена. Удалено товаров: {count}")
     await state.update_data(prev_messages=[msg.message_id])
+    await save_bot_message(user_id, msg.message_id)
     log_action(user_id, "cart_cleared", f"items: {count}")
 
 # ==================== КАТАЛОГ И ЗАКАЗЫ ====================
@@ -712,6 +1049,7 @@ async def process_district(callback: types.CallbackQuery, state: FSMContext):
         reply_markup=cities_in_district_kb(district_key)
     )
     await state.update_data(prev_messages=[msg.message_id])
+    await save_bot_message(callback.from_user.id, msg.message_id)
     log_action(callback.from_user.id, "district_selected", district_name)
 
 @dp.callback_query(F.data.startswith("city_"))
@@ -736,6 +1074,7 @@ async def process_city(callback: types.CallbackQuery, state: FSMContext):
         reply_markup=categories_kb()
     )
     await state.update_data(prev_messages=[msg.message_id])
+    await save_bot_message(callback.from_user.id, msg.message_id)
     log_action(callback.from_user.id, "city_selected", f"{district_name} - {city}")
 
 @dp.callback_query(F.data.startswith("cat_"))
@@ -762,6 +1101,7 @@ async def process_category(callback: types.CallbackQuery, state: FSMContext):
     if not products:
         msg = await callback.message.answer(f"В городе {city} нет товаров в категории {category}")
         await state.update_data(prev_messages=[msg.message_id])
+        await save_bot_message(callback.from_user.id, msg.message_id)
         return
     
     builder = InlineKeyboardBuilder()
@@ -784,6 +1124,7 @@ async def process_category(callback: types.CallbackQuery, state: FSMContext):
         reply_markup=builder.as_markup()
     )
     await state.update_data(prev_messages=[msg.message_id])
+    await save_bot_message(callback.from_user.id, msg.message_id)
     log_action(callback.from_user.id, "category_selected", category)
 
 @dp.callback_query(F.data.startswith("prod_"))
@@ -813,6 +1154,7 @@ async def process_product(callback: types.CallbackQuery, state: FSMContext):
             f"Введите количество:"
         )
         await state.update_data(prev_messages=[msg.message_id])
+        await save_bot_message(callback.from_user.id, msg.message_id)
         log_action(callback.from_user.id, "product_selected", name)
 
 @dp.message(OrderState.choosing_quantity)
@@ -828,10 +1170,12 @@ async def process_quantity(message: types.Message, state: FSMContext):
         if quantity <= 0 or quantity > 100:
             msg = await message.answer("Введите число от 1 до 100:")
             await state.update_data(prev_messages=[msg.message_id])
+            await save_bot_message(message.from_user.id, msg.message_id)
             return
     except:
         msg = await message.answer("Введите число:")
         await state.update_data(prev_messages=[msg.message_id])
+        await save_bot_message(message.from_user.id, msg.message_id)
         return
     
     data = await state.get_data()
@@ -851,6 +1195,7 @@ async def process_quantity(message: types.Message, state: FSMContext):
         reply_markup=crypto_kb()
     )
     await state.update_data(prev_messages=[msg.message_id])
+    await save_bot_message(message.from_user.id, msg.message_id)
     log_action(message.from_user.id, "quantity_entered", f"{data['product_name']} x{quantity}")
 
 @dp.callback_query(F.data.startswith("crypto_"))
@@ -876,6 +1221,7 @@ async def process_crypto(callback: types.CallbackQuery, state: FSMContext):
     if crypto not in crypto_prices:
         msg = await callback.message.answer("Неверная валюта. Выберите снова.", reply_markup=crypto_kb())
         await state.update_data(prev_messages=[msg.message_id])
+        await save_bot_message(callback.from_user.id, msg.message_id)
         return
     
     crypto_amount = total_rub / crypto_prices[crypto]
@@ -902,6 +1248,7 @@ async def process_crypto(callback: types.CallbackQuery, state: FSMContext):
         reply_markup=kb
     )
     await state.update_data(prev_messages=[msg.message_id])
+    await save_bot_message(callback.from_user.id, msg.message_id)
     log_action(callback.from_user.id, "crypto_selected", f"{crypto}")
 
 @dp.callback_query(F.data == "confirm_order")
@@ -929,6 +1276,7 @@ async def confirm_order(callback: types.CallbackQuery, state: FSMContext):
             "❌ Ошибка оплаты. Попробуйте позже."
         )
         await state.update_data(prev_messages=[msg.message_id])
+        await save_bot_message(user_id, msg.message_id)
         log_action(user_id, "cryptobot_api_error", "Failed to create invoice")
         return
     
@@ -985,6 +1333,8 @@ async def confirm_order(callback: types.CallbackQuery, state: FSMContext):
     )
     
     await state.update_data(prev_messages=[msg1.message_id, msg2.message_id])
+    await save_bot_message(user_id, msg1.message_id)
+    await save_bot_message(user_id, msg2.message_id)
     log_action(user_id, "order_created", 
               f"order: {order_id}, city: {data['city']}, crypto: {data['crypto']}, code: {six_digit_code}")
 
@@ -999,6 +1349,7 @@ async def cancel_order(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     msg = await callback.message.answer("❌ Заказ отменен.")
     await state.update_data(prev_messages=[msg.message_id])
+    await save_bot_message(callback.from_user.id, msg.message_id)
     log_action(callback.from_user.id, "order_cancelled")
 
 @dp.callback_query(F.data.startswith("check_"))
@@ -1039,6 +1390,7 @@ async def check_payment_callback(callback: types.CallbackQuery, state: FSMContex
                 f"{SUPPORT_USERNAME}"
             )
             await state.update_data(prev_messages=[msg.message_id])
+            await save_bot_message(user_id, msg.message_id)
             await callback.answer("Оплата подтверждена!")
             log_action(user_id, "payment_confirmed_callback", f"order: {order_id}, code: {six_digit_code}")
         else:
